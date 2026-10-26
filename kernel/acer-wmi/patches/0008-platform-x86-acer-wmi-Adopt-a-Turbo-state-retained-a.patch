@@ -1,0 +1,78 @@
+From a5af31e646283709436b595beef6b0e8ebac0a7c Mon Sep 17 00:00:00 2001
+From: Nicholas DeTello <no-reply@detello.com>
+Date: Tue, 6 Oct 2026 07:47:30 -0400
+Subject: [PATCH 08/11] platform/x86: acer-wmi: Adopt a Turbo state retained
+ across reboot
+
+After a warm reboot the EC keeps its turbo state while the new driver
+instance starts without key ownership, so selecting a non-Turbo profile
+leaves the firmware's turbo state and the fans in turbo mode. Before
+committing a non-Turbo profile request on a turbo_profile model with no
+recorded key request and the LED capability present, read the
+firmware's turbo state; if it is on, switch turbo mode off together with
+the profile change, as if the key had enabled it. The read precedes the
+profile write, so a read failure leaves the profile unchanged, and turbo
+mode is only switched off once the write succeeded. This does not change
+the first key press after such a boot; that remains userspace policy.
+
+The LED capability is checked although the quirk implies it, because
+force_caps may have removed it; without the check every non-Turbo
+profile write would then fail with -EIO.
+
+Tested on the PT516-52s: after a warm reboot with turbo mode on,
+userspace wrote the balanced profile at boot and the next key press
+turned turbo mode on, so the retained firmware state had been cleared.
+
+Assisted-by: LLM
+---
+ drivers/platform/x86/acer-wmi.c | 20 ++++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/platform/x86/acer-wmi.c b/drivers/platform/x86/acer-wmi.c
+index 716c0116b..60a722f49 100644
+--- a/drivers/platform/x86/acer-wmi.c
++++ b/drivers/platform/x86/acer-wmi.c
+@@ -2320,6 +2320,7 @@ static int
+ acer_predator_v4_platform_profile_set(struct device *dev,
+ 				      enum platform_profile_option profile)
+ {
++	bool retained = false;
+ 	int err, tp;
+ 
+ 	switch (profile) {
+@@ -2343,6 +2344,18 @@ acer_predator_v4_platform_profile_set(struct device *dev,
+ 	}
+ 
+ 	mutex_lock(&acer_turbo_lock);
++	/*
++	 * Read before committing a profile change so errors leave it unchanged.
++	 * force_caps may have removed the LED capability.
++	 */
++	if (tp != ACER_PREDATOR_V4_THERMAL_PROFILE_TURBO &&
++	    quirks->turbo_profile && !turbo_key_profile &&
++	    has_cap(ACER_CAP_TURBO_LED)) {
++		err = acer_get_turbo_led(&retained);
++		if (err)
++			goto out;
++	}
++
+ 	err = WMID_gaming_set_misc_setting(ACER_WMID_MISC_SETTING_PLATFORM_PROFILE, tp);
+ 	if (err)
+ 		goto out;
+@@ -2350,8 +2363,11 @@ acer_predator_v4_platform_profile_set(struct device *dev,
+ 	if (tp != ACER_PREDATOR_V4_THERMAL_PROFILE_TURBO) {
+ 		last_non_turbo_profile = tp;
+ 
+-		/* Leaving the Turbo profile also ends turbo mode set by the key. */
+-		if (turbo_key_profile) {
++		/*
++		 * Leaving the Turbo profile also ends turbo mode set by the key
++		 * or retained by the firmware across a reboot.
++		 */
++		if (turbo_key_profile || retained) {
+ 			turbo_key_profile = false;
+ 			acer_set_turbo(false);
+ 		}
+-- 
+2.54.0
+

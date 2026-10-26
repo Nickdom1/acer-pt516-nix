@@ -1,0 +1,9 @@
+repo: https://git.kernel.org/pub/scm/linux/kernel/git/pdx86/platform-drivers-x86.git
+branch: review-ilpo-next
+commit: 2622c23b7b640476a06d767b6ae63315ba5993a8
+date: 2026-10-05
+path: drivers/platform/x86/acer-wmi.c
+plain: https://git.kernel.org/pub/scm/linux/kernel/git/pdx86/platform-drivers-x86.git/plain/drivers/platform/x86/acer-wmi.c?id=2622c23b7b640476a06d767b6ae63315ba5993a8
+sha256: d4abd6c93c44a9e5e28bbee9045fc53b1c2137cb213ed2a592ba114b490e3682
+license: GPL-2.0-or-later (SPDX line in the file)
+vendored: the commit is reachable only from a moving review branch; the plain URL is a cross-check that may stop resolving

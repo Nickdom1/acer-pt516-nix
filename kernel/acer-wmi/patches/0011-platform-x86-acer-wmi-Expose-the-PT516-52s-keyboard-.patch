@@ -1,0 +1,262 @@
+From 7cf5a7c3615952b30a08bb190d3d78a68a1d667a Mon Sep 17 00:00:00 2001
+From: Nicholas DeTello <no-reply@detello.com>
+Date: Tue, 6 Oct 2026 07:49:44 -0400
+Subject: [PATCH 11/11] platform/x86: acer-wmi: Expose the PT516-52s keyboard
+ backlight timeout
+
+The PT516-52s firmware turns the keyboard backlight off after an idle
+period, 30 seconds by default. Lighting changes are then invisible until
+a key is pressed.
+
+The timeout is reached through the WMID_GUID3 interface already used for
+the communication devices. Method 2 (get) takes four bytes: function
+number 1, the keyboard backlight hotkey number and 0x08 in byte 2. It
+returns eight bytes: error code and EC status in bytes 0 and 1, the
+backlight level in byte 4 and the timeout in seconds in byte 5. Method 1
+(set) takes eight bytes with the same layout, function number 2 and the
+level and timeout in bytes 4 and 5, and returns the two status bytes. A
+timeout of 0 means the backlight is never turned off when idle. The
+layout matches the Linuwu-Sense, OpenSense and ASense projects, and the
+BIOS V1.04 MOF defines the input and output sizes.
+
+The hotkey number, 0x84, is taken from a model quirk. It appears in this
+machine's SMBIOS type 170 records, but type_aa_dmi_decode() only reads
+the table header, and the record layout has been checked on this model
+only.
+
+Add a kbd_backlight_timeout attribute on the platform device, in seconds
+from 0 to 255, registered through the driver's attribute groups and
+visible when the quirk provides a hotkey and WMID_GUID3 is present. A
+write reads the current level first so it is preserved, and accesses are
+serialized. Reads always query the firmware, and firmware errors and
+malformed replies are returned to userspace as errors. The driver writes
+the timeout only when userspace asks: nothing is set at probe or
+restored on removal. Document the ABI and add the file to the acer-wmi
+MAINTAINERS entry.
+
+Assisted-by: LLM
+---
+ .../ABI/testing/sysfs-platform-acer-wmi       |  13 ++
+ MAINTAINERS                                   |   1 +
+ drivers/platform/x86/acer-wmi.c               | 145 ++++++++++++++++++
+ 3 files changed, 159 insertions(+)
+ create mode 100644 Documentation/ABI/testing/sysfs-platform-acer-wmi
+
+diff --git a/Documentation/ABI/testing/sysfs-platform-acer-wmi b/Documentation/ABI/testing/sysfs-platform-acer-wmi
+new file mode 100644
+index 000000000..4d848ab4b
+--- /dev/null
++++ b/Documentation/ABI/testing/sysfs-platform-acer-wmi
+@@ -0,0 +1,13 @@
++What:		/sys/devices/platform/acer-wmi/kbd_backlight_timeout
++Date:		October 2026
++KernelVersion:	7.4
++Contact:	platform-driver-x86@vger.kernel.org
++Description:
++		Idle time in seconds after which the firmware turns off the
++		keyboard backlight. Accepts decimal values from 0 to 255;
++		0 means the backlight is never turned off when idle. The
++		setting applies to the whole keyboard backlight. Writing it
++		leaves the keyboard brightness unchanged. Reading returns the
++		value currently held by the firmware.
++
++		Only present on supported models.
+diff --git a/MAINTAINERS b/MAINTAINERS
+index fa0571a5e..0add845e3 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -273,6 +273,7 @@ ACER WMI LAPTOP EXTRAS
+ M:	"Lee, Chun-Yi" <jlee@suse.com>
+ L:	platform-driver-x86@vger.kernel.org
+ S:	Maintained
++F:	Documentation/ABI/testing/sysfs-platform-acer-wmi
+ F:	drivers/platform/x86/acer-wmi.c
+ 
+ ACPI
+diff --git a/drivers/platform/x86/acer-wmi.c b/drivers/platform/x86/acer-wmi.c
+index e94f7807d..74a967293 100644
+--- a/drivers/platform/x86/acer-wmi.c
++++ b/drivers/platform/x86/acer-wmi.c
+@@ -123,6 +123,15 @@ MODULE_LICENSE("GPL");
+ #define ACER_PREDATOR_V4_SENSOR_READING_BIT_MASK GENMASK_ULL(23, 8)
+ #define ACER_PREDATOR_V4_SUPPORTED_SENSORS_BIT_MASK GENMASK_ULL(39, 24)
+ 
++#define ACER_WMID3_SET_FUNCTION_METHODID	1
++#define ACER_WMID3_GET_FUNCTION_METHODID	2
++#define ACER_WMID3_FUNCTION_GET			1
++#define ACER_WMID3_FUNCTION_SET			2
++#define ACER_WMID3_KBD_BACKLIGHT_FUNCTION	BIT(3)
++#define ACER_WMID3_STATUS_MASK			GENMASK_ULL(15, 0)
++#define ACER_WMID3_KBD_BRIGHTNESS_MASK		GENMASK_ULL(39, 32)
++#define ACER_WMID3_KBD_TIMEOUT_MASK		GENMASK_ULL(47, 40)
++
+ /*
+  * Acer ACPI method GUIDs
+  */
+@@ -434,6 +443,7 @@ struct quirk_entry {
+ 	bool platform_profile;
+ 	bool pwm;
+ 	u8 kbd_rgb_zones;
++	u8 kbd_backlight_hotkey;
+ };
+ 
+ static struct quirk_entry *quirks;
+@@ -542,6 +552,8 @@ static struct quirk_entry quirk_acer_predator_pt516_52s = {
+ 	.platform_profile = true,
+ 	.pwm = true,
+ 	.kbd_rgb_zones = 3,
++	/* Keyboard backlight hotkey, from this model's SMBIOS type 170 records */
++	.kbd_backlight_hotkey = 0x84,
+ };
+ 
+ static struct quirk_entry quirk_acer_predator_v4 = {
+@@ -3175,6 +3187,138 @@ static int acer_kbd_rgb_init(struct device *dev)
+ 	return 0;
+ }
+ 
++/*
++ * APGeAction keyboard backlight timeout. GetFunction takes four bytes and
++ * returns eight; SetFunction takes eight bytes and returns four. The first
++ * two reply bytes are firmware and EC status, followed by device state.
++ */
++static DEFINE_MUTEX(acer_kbd_backlight_lock);
++
++static int acer_kbd_backlight_timeout(bool set, u8 *brightness, u8 *timeout)
++{
++	u8 params[8] = { set ? ACER_WMID3_FUNCTION_SET : ACER_WMID3_FUNCTION_GET,
++			 quirks->kbd_backlight_hotkey, ACER_WMID3_KBD_BACKLIGHT_FUNCTION };
++	struct acpi_buffer input = { set ? sizeof(params) : sizeof(u32), params };
++	struct acpi_buffer output = { ACPI_ALLOCATE_BUFFER, NULL };
++	unsigned int result_size = set ? sizeof(u32) : sizeof(u64);
++	union acpi_object *obj;
++	acpi_status status;
++	u64 result;
++	int ret = 0;
++
++	if (set) {
++		params[4] = *brightness;
++		params[5] = *timeout;
++	}
++
++	status = wmi_evaluate_method(WMID_GUID3, 0,
++				     set ? ACER_WMID3_SET_FUNCTION_METHODID :
++					   ACER_WMID3_GET_FUNCTION_METHODID,
++				     &input, &output);
++	if (ACPI_FAILURE(status))
++		return -EIO;
++
++	obj = output.pointer;
++	if (!obj) {
++		ret = -ENOMSG;
++		goto out;
++	}
++
++	switch (obj->type) {
++	case ACPI_TYPE_BUFFER:
++		if (obj->buffer.length < result_size) {
++			ret = -ENOMSG;
++			goto out;
++		}
++		if (set)
++			result = get_unaligned_le32(obj->buffer.pointer);
++		else
++			result = get_unaligned_le64(obj->buffer.pointer);
++		break;
++	case ACPI_TYPE_INTEGER:
++		result = obj->integer.value;
++		break;
++	default:
++		ret = -ENOMSG;
++		goto out;
++	}
++
++	if (result & ACER_WMID3_STATUS_MASK) {
++		ret = -EIO;
++		goto out;
++	}
++
++	if (!set) {
++		*brightness = FIELD_GET(ACER_WMID3_KBD_BRIGHTNESS_MASK, result);
++		*timeout = FIELD_GET(ACER_WMID3_KBD_TIMEOUT_MASK, result);
++	}
++
++out:
++	kfree(obj);
++	return ret;
++}
++
++static ssize_t kbd_backlight_timeout_show(struct device *dev,
++					  struct device_attribute *attr, char *buf)
++{
++	u8 brightness, timeout;
++	int ret;
++
++	mutex_lock(&acer_kbd_backlight_lock);
++	ret = acer_kbd_backlight_timeout(false, &brightness, &timeout);
++	mutex_unlock(&acer_kbd_backlight_lock);
++	if (ret)
++		return ret;
++
++	return sysfs_emit(buf, "%u\n", timeout);
++}
++
++static ssize_t kbd_backlight_timeout_store(struct device *dev,
++					   struct device_attribute *attr,
++					   const char *buf, size_t count)
++{
++	u8 brightness, old_timeout, timeout;
++	int ret;
++
++	ret = kstrtou8(buf, 10, &timeout);
++	if (ret)
++		return ret;
++
++	mutex_lock(&acer_kbd_backlight_lock);
++	/* SetFunction also changes brightness, so preserve its current value. */
++	ret = acer_kbd_backlight_timeout(false, &brightness, &old_timeout);
++	if (!ret)
++		ret = acer_kbd_backlight_timeout(true, &brightness, &timeout);
++	mutex_unlock(&acer_kbd_backlight_lock);
++
++	if (ret)
++		return ret;
++
++	return count;
++}
++static DEVICE_ATTR_RW(kbd_backlight_timeout);
++
++static struct attribute *acer_platform_attrs[] = {
++	&dev_attr_kbd_backlight_timeout.attr,
++	NULL
++};
++
++static umode_t acer_platform_attr_is_visible(struct kobject *kobj,
++					     struct attribute *attr, int n)
++{
++	if (attr == &dev_attr_kbd_backlight_timeout.attr &&
++	    !(quirks->kbd_backlight_hotkey && wmi_has_guid(WMID_GUID3)))
++		return 0;
++
++	return attr->mode;
++}
++
++static const struct attribute_group acer_platform_group = {
++	.attrs = acer_platform_attrs,
++	.is_visible = acer_platform_attr_is_visible,
++};
++__ATTRIBUTE_GROUPS(acer_platform);
++
+ /*
+  * Platform device
+  */
+@@ -3313,6 +3457,7 @@ static struct platform_driver acer_platform_driver = {
+ 	.driver = {
+ 		.name = "acer-wmi",
+ 		.pm = &acer_pm,
++		.dev_groups = acer_platform_groups,
+ 	},
+ 	.probe = acer_platform_probe,
+ 	.remove = acer_platform_remove,
+-- 
+2.54.0
+

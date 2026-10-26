@@ -1,0 +1,5 @@
+export: release
+repo: https://gitlab.freedesktop.org/upower/power-profiles-daemon.git
+release: 0.30 = 5b4994c8a91290481bef87a5bae95391d0ec677f
+0001-balanced-performance-spelling.patch: prep/ppd-spelling-0.30 = 3fe661e528ff977bcea17dd7e693069d60ab81c0 (src/; backport of 16c0ad23a58aa57f0a8dd51045f6776831cbfc26) sha256 41b64317c92e02601629f70556c934d81461ca48e49964ba11097eb086d6e909
+0002-intel-pstate-governor.patch: prep/ppd-governor = 1c6750eefe668a303743a3669f21c8a71f882aaa (src/ppd-driver-intel-pstate.c) sha256 148bbb020de577a7f3d98eb709c26652708a24af0b56f49388503fd530d6d2c1

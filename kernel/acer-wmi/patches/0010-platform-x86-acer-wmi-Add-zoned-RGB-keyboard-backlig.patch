@@ -1,0 +1,320 @@
+From b86be6485ed5dad42b929eeb3fc46e29354bea77 Mon Sep 17 00:00:00 2001
+From: Nicholas DeTello <no-reply@detello.com>
+Date: Tue, 6 Oct 2026 07:48:59 -0400
+Subject: [PATCH 10/11] platform/x86: acer-wmi: Add zoned RGB keyboard
+ backlight for the PT516-52s
+
+The Predator PT516-52s has a three zone RGB keyboard backlight that the
+firmware drives through the gaming WMI interface the driver already
+uses. In WMBH, SetGamingRgbKb (method 6) takes {zone bit, R, G, B} and
+GetGamingRgbKb (method 7) takes a zone bit and returns {status, R, G, B};
+the firmware compares the zone byte for equality, so each call carries
+exactly one zone. SetGamingLED (method 2) with LED id 0x08 writes the
+zone enable mask (EC register KBST). Method 6 takes eight bytes and
+method 7 four, matching the existing SetGamingFanBehavior/
+GetGamingFanBehavior pair, so they use WMI_gaming_execute_u64() and
+WMI_gaming_execute_u32_u64() respectively.
+
+Add a kbd_rgb_zones quirk field, set it to 3 for the PT516-52s, and
+register one multicolor LED class device per zone, named as described
+for zoned keyboards in Documentation/leds/leds-class.rst:
+
+  acer-wmi:rgb:kbd_zoned_backlight-left
+  acer-wmi:rgb:kbd_zoned_backlight-middle
+  acer-wmi:rgb:kbd_zoned_backlight-right
+
+Method 6 accepts four zone slots, but method 7 reads back only the first
+three, and the keyboard has three zones; probing enables all four slots
+(0x0f) so that no physical zone stays dark. Method 6 has no
+brightness field, so each device has red, green and blue subleds with a
+maximum of 255 and brightness is applied by scaling the colour. Each
+device starts from the colour the firmware reports; a black or
+unreadable zone starts off with a white colour. Only static colours are
+supported.
+
+The devices carry LED_RETAIN_AT_SHUTDOWN so that unbinding or unloading
+the driver leaves the keyboard colour as it is. A failure to set up the
+backlight is reported but does not fail the probe.
+
+GetGamingSysInfo (method 5) sets the EC flag PSEE on every call. Other
+implementations of this interface call it before enabling the zones, so
+the driver does the same rather than relying on the hwmon probe having
+run.
+
+Assisted-by: LLM
+---
+ drivers/platform/x86/acer-wmi.c | 195 ++++++++++++++++++++++++++++++++
+ 1 file changed, 195 insertions(+)
+
+diff --git a/drivers/platform/x86/acer-wmi.c b/drivers/platform/x86/acer-wmi.c
+index 60a722f49..e94f7807d 100644
+--- a/drivers/platform/x86/acer-wmi.c
++++ b/drivers/platform/x86/acer-wmi.c
+@@ -12,6 +12,8 @@
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
+ #include <linux/kernel.h>
++#include <linux/bits.h>
++#include <linux/container_of.h>
+ #include <linux/minmax.h>
+ #include <linux/mutex.h>
+ #include <linux/module.h>
+@@ -21,6 +23,7 @@
+ #include <linux/fixp-arith.h>
+ #include <linux/backlight.h>
+ #include <linux/leds.h>
++#include <linux/led-class-multicolor.h>
+ #include <linux/platform_device.h>
+ #include <linux/platform_profile.h>
+ #include <linux/acpi.h>
+@@ -71,6 +74,8 @@ MODULE_LICENSE("GPL");
+ #define ACER_WMID_SET_GAMING_LED_METHODID 2
+ #define ACER_WMID_GET_GAMING_LED_METHODID 4
+ #define ACER_WMID_GET_GAMING_SYS_INFO_METHODID 5
++#define ACER_WMID_SET_GAMING_RGB_KB_METHODID 6
++#define ACER_WMID_GET_GAMING_RGB_KB_METHODID 7
+ #define ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID 14
+ #define ACER_WMID_GET_GAMING_FAN_BEHAVIOR_METHODID 15
+ #define ACER_WMID_SET_GAMING_FAN_SPEED_METHODID 16
+@@ -97,6 +102,17 @@ MODULE_LICENSE("GPL");
+ #define ACER_GAMING_LED_SET_STATE_VALID	BIT(4)
+ #define ACER_GAMING_LED_STATUS_MASK	GENMASK_ULL(7, 0)
+ #define ACER_GAMING_LED_STATE_MASK	GENMASK_ULL(15, 8)
++#define ACER_GAMING_LED_KBD		0x08
++#define ACER_GAMING_LED_ID_MASK		GENMASK_ULL(7, 0)
++#define ACER_GAMING_LED_KBD_ZONES_MASK	GENMASK_ULL(47, 40)
++/* The firmware has four zone slots; enable all of them */
++#define ACER_GAMING_LED_KBD_ZONES_ALL	GENMASK(3, 0)
++
++#define ACER_GAMING_RGB_KB_STATUS_MASK	GENMASK_ULL(7, 0)
++#define ACER_GAMING_RGB_KB_ZONE_MASK	GENMASK_ULL(7, 0)
++#define ACER_GAMING_RGB_KB_RED_MASK	GENMASK_ULL(15, 8)
++#define ACER_GAMING_RGB_KB_GREEN_MASK	GENMASK_ULL(23, 16)
++#define ACER_GAMING_RGB_KB_BLUE_MASK	GENMASK_ULL(31, 24)
+ 
+ #define ACER_GAMING_MISC_SETTING_STATUS_MASK GENMASK_ULL(7, 0)
+ #define ACER_GAMING_MISC_SETTING_INDEX_MASK GENMASK_ULL(7, 0)
+@@ -317,6 +333,7 @@ struct hotkey_function_type_aa {
+ #define ACER_CAP_PLATFORM_PROFILE	BIT(10)
+ #define ACER_CAP_HWMON			BIT(11)
+ #define ACER_CAP_PWM			BIT(12)
++#define ACER_CAP_KBD_RGB		BIT(13)
+ 
+ /*
+  * Interface type flags
+@@ -416,6 +433,7 @@ struct quirk_entry {
+ 	bool hwmon;
+ 	bool platform_profile;
+ 	bool pwm;
++	u8 kbd_rgb_zones;
+ };
+ 
+ static struct quirk_entry *quirks;
+@@ -440,6 +458,9 @@ static void __init set_quirks(void)
+ 
+ 	if (quirks->pwm)
+ 		interface->capability |= ACER_CAP_PWM;
++
++	if (quirks->kbd_rgb_zones)
++		interface->capability |= ACER_CAP_KBD_RGB;
+ }
+ 
+ static int __init dmi_matched(const struct dmi_system_id *dmi)
+@@ -520,6 +541,7 @@ static struct quirk_entry quirk_acer_predator_pt516_52s = {
+ 	.hwmon = true,
+ 	.platform_profile = true,
+ 	.pwm = true,
++	.kbd_rgb_zones = 3,
+ };
+ 
+ static struct quirk_entry quirk_acer_predator_v4 = {
+@@ -2988,6 +3010,171 @@ static u32 get_wmid_devices(void)
+ 
+ static int acer_wmi_hwmon_init(void);
+ 
++/*
++ * Zoned RGB keyboard backlight
++ *
++ * The gaming WMI interface addresses up to four keyboard zones by bit
++ * (zone n is BIT(n)). SetGamingLED with LED id 0x08 writes the mask of
++ * enabled zones. SetGamingRgbKb and GetGamingRgbKb set and read back the
++ * colour of one zone, 8 bits per channel; the firmware compares the zone
++ * byte for equality, so each call carries exactly one zone bit.
++ */
++#define ACER_KBD_RGB_CHANNELS	3
++#define ACER_KBD_RGB_MAX	U8_MAX
++
++static const char * const acer_kbd_rgb_zone_names[] = {
++	"left",
++	"middle",
++	"right",
++};
++
++struct acer_kbd_rgb_zone {
++	struct led_classdev_mc mc_cdev;
++	struct mc_subled subleds[ACER_KBD_RGB_CHANNELS];
++	unsigned int index;
++};
++
++static int acer_kbd_rgb_enable_zones(void)
++{
++	acpi_status status;
++	u64 input = 0;
++	u64 result;
++	int ret;
++
++	/*
++	 * GetGamingSysInfo sets the EC flag PSEE; other users of this
++	 * interface call it before enabling the zones.
++	 */
++	ret = WMID_gaming_get_sys_info(ACER_WMID_CMD_GET_PREDATOR_V4_SUPPORTED_SENSORS, &result);
++	if (ret)
++		return ret;
++
++	input |= FIELD_PREP(ACER_GAMING_LED_ID_MASK, ACER_GAMING_LED_KBD);
++	input |= FIELD_PREP(ACER_GAMING_LED_KBD_ZONES_MASK, ACER_GAMING_LED_KBD_ZONES_ALL);
++
++	status = WMI_gaming_execute_u64(ACER_WMID_SET_GAMING_LED_METHODID, input, &result);
++	if (ACPI_FAILURE(status))
++		return -EIO;
++
++	/* The return status must be zero for the operation to have succeeded */
++	if (FIELD_GET(ACER_GAMING_LED_STATUS_MASK, result))
++		return -EIO;
++
++	return 0;
++}
++
++static int acer_kbd_rgb_get_color(unsigned int index, u8 rgb[ACER_KBD_RGB_CHANNELS])
++{
++	u64 result;
++	int ret;
++
++	ret = WMI_gaming_execute_u32_u64(ACER_WMID_GET_GAMING_RGB_KB_METHODID,
++					 FIELD_PREP(ACER_GAMING_RGB_KB_ZONE_MASK, BIT(index)),
++					 &result);
++	if (ret < 0)
++		return ret;
++
++	/* The return status must be zero for the operation to have succeeded */
++	if (FIELD_GET(ACER_GAMING_RGB_KB_STATUS_MASK, result))
++		return -EIO;
++
++	rgb[0] = FIELD_GET(ACER_GAMING_RGB_KB_RED_MASK, result);
++	rgb[1] = FIELD_GET(ACER_GAMING_RGB_KB_GREEN_MASK, result);
++	rgb[2] = FIELD_GET(ACER_GAMING_RGB_KB_BLUE_MASK, result);
++
++	return 0;
++}
++
++static int acer_kbd_rgb_brightness_set(struct led_classdev *cdev,
++				       enum led_brightness brightness)
++{
++	struct led_classdev_mc *mc_cdev = lcdev_to_mccdev(cdev);
++	struct acer_kbd_rgb_zone *zone;
++	acpi_status status;
++	u64 input = 0;
++	u64 result;
++
++	zone = container_of(mc_cdev, struct acer_kbd_rgb_zone, mc_cdev);
++	led_mc_calc_color_components(mc_cdev, brightness);
++
++	input |= FIELD_PREP(ACER_GAMING_RGB_KB_ZONE_MASK, BIT(zone->index));
++	input |= FIELD_PREP(ACER_GAMING_RGB_KB_RED_MASK, zone->subleds[0].brightness);
++	input |= FIELD_PREP(ACER_GAMING_RGB_KB_GREEN_MASK, zone->subleds[1].brightness);
++	input |= FIELD_PREP(ACER_GAMING_RGB_KB_BLUE_MASK, zone->subleds[2].brightness);
++
++	status = WMI_gaming_execute_u64(ACER_WMID_SET_GAMING_RGB_KB_METHODID, input, &result);
++	if (ACPI_FAILURE(status))
++		return -EIO;
++
++	/* The return status must be zero for the operation to have succeeded */
++	if (FIELD_GET(ACER_GAMING_RGB_KB_STATUS_MASK, result))
++		return -EIO;
++
++	return 0;
++}
++
++static int acer_kbd_rgb_init(struct device *dev)
++{
++	static const unsigned int color_ids[ACER_KBD_RGB_CHANNELS] = {
++		LED_COLOR_ID_RED, LED_COLOR_ID_GREEN, LED_COLOR_ID_BLUE,
++	};
++	unsigned int zones = quirks->kbd_rgb_zones;
++	struct acer_kbd_rgb_zone *zone;
++	u8 rgb[ACER_KBD_RGB_CHANNELS];
++	unsigned int i, j;
++	bool lit;
++	int ret;
++
++	if (zones > ARRAY_SIZE(acer_kbd_rgb_zone_names))
++		return -EINVAL;
++
++	ret = acer_kbd_rgb_enable_zones();
++	if (ret)
++		return ret;
++
++	for (i = 0; i < zones; i++) {
++		zone = devm_kzalloc(dev, sizeof(*zone), GFP_KERNEL);
++		if (!zone)
++			return -ENOMEM;
++
++		zone->index = i;
++
++		/*
++		 * Start from the colour the firmware restored. If it is black or
++		 * unreadable, report the zone as off with a white colour, so that
++		 * writing brightness alone turns it on.
++		 */
++		lit = !acer_kbd_rgb_get_color(i, rgb) && memchr_inv(rgb, 0, sizeof(rgb));
++		if (!lit)
++			memset(rgb, ACER_KBD_RGB_MAX, sizeof(rgb));
++
++		for (j = 0; j < ACER_KBD_RGB_CHANNELS; j++) {
++			zone->subleds[j].color_index = color_ids[j];
++			zone->subleds[j].intensity = rgb[j];
++		}
++
++		zone->mc_cdev.subled_info = zone->subleds;
++		zone->mc_cdev.num_colors = ACER_KBD_RGB_CHANNELS;
++
++		zone->mc_cdev.led_cdev.name =
++			devm_kasprintf(dev, GFP_KERNEL, "acer-wmi:rgb:kbd_zoned_backlight-%s",
++				       acer_kbd_rgb_zone_names[i]);
++		if (!zone->mc_cdev.led_cdev.name)
++			return -ENOMEM;
++
++		zone->mc_cdev.led_cdev.max_brightness = ACER_KBD_RGB_MAX;
++		zone->mc_cdev.led_cdev.brightness = lit ? ACER_KBD_RGB_MAX : LED_OFF;
++		zone->mc_cdev.led_cdev.brightness_set_blocking = acer_kbd_rgb_brightness_set;
++		zone->mc_cdev.led_cdev.flags = LED_RETAIN_AT_SHUTDOWN | LED_REJECT_NAME_CONFLICT;
++
++		ret = devm_led_classdev_multicolor_register(dev, &zone->mc_cdev);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
+ /*
+  * Platform device
+  */
+@@ -3023,6 +3210,14 @@ static int acer_platform_probe(struct platform_device *device)
+ 			goto error_hwmon;
+ 	}
+ 
++	/* The keyboard backlight is not essential, keep the rest of the driver usable */
++	if (has_cap(ACER_CAP_KBD_RGB)) {
++		err = acer_kbd_rgb_init(&device->dev);
++		if (err)
++			dev_warn(&device->dev, "Failed to set up the RGB keyboard backlight: %d\n",
++				 err);
++	}
++
+ 	return 0;
+ 
+ error_hwmon:
+-- 
+2.54.0
+

@@ -1,0 +1,214 @@
+From ea4bda4bfd278993791e624147bfe61bb992076a Mon Sep 17 00:00:00 2001
+From: Nicholas DeTello <no-reply@detello.com>
+Date: Tue, 6 Oct 2026 07:47:30 -0400
+Subject: [PATCH 07/11] platform/x86: acer-wmi: Select the Turbo profile with
+ the Turbo key
+
+On machines whose Turbo key raises key number 4 but which also support
+the PredatorSense v4 thermal profiles, the key only switches the turbo
+LED, the fans and the overclocking settings. The thermal profile, which
+is what makes the firmware switch its power policy, stays where it was.
+
+On the Predator PT516-52s, writing the Turbo profile (misc setting 0x0B,
+value 5) also updates the platform's DTT operating mode and notifies the
+NVIDIA platform controller:
+
+  \_SB.PC00.LPCB.EC0.OPMS = Local1
+  ...
+  \_SB.IETM.ODVP ()
+  Notify (\_SB.IETM, 0x88)
+  Notify (\_SB.NPCF, 0xC0)
+  Notify (\_SB.NPCF, 0xC1)
+
+and the NVIDIA driver raises the GPU's enforced power limit in response.
+Switching the fans and the OC settings alone does not change the
+thermal profile, so that part of turbo mode leaves the budget where it
+was. (This firmware rejects the OC writes, misc settings 5 and 7, with
+status 3; WMID_gaming_set_misc_setting() reports that as -EIO, which the
+turbo path has always ignored, so they are left in place.)
+
+Add a turbo_profile quirk, set only for the PT516-52s, that makes the
+key also select the Turbo profile, remembering the previous profile and
+restoring it when turbo mode is switched off. When userspace selects a
+different profile while the key's turbo mode is active, switch turbo
+mode off as well, so a profile change does not leave the LED and fans in
+turbo mode. The PH16-72 and PT14-51 also combine .turbo with a platform
+profile but are untested, so their key behaviour is unchanged.
+
+The key holds the driver mutex for the whole transition and notifies the
+profile core after dropping it, so a concurrent profile write cannot
+land between the key's profile and fan writes. Fan mode writes through
+hwmon do not take the mutex: they share no driver state with the key, so
+a concurrent pwm*_enable write only decides which fan mode the firmware
+ends up in, as before. A failed key press is reported with a
+rate-limited warning.
+
+Tested on the PT516-52s: the key selects the Turbo profile with fan
+turbo mode, the next press restores the previous profile and automatic
+fans, and selecting another profile through power-profiles-daemon while
+key turbo is active ends it. A key press concurrent with a profile write
+has not been exercised on hardware.
+
+Assisted-by: LLM
+---
+ drivers/platform/x86/acer-wmi.c | 85 +++++++++++++++++++++++++++++----
+ 1 file changed, 76 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/platform/x86/acer-wmi.c b/drivers/platform/x86/acer-wmi.c
+index 1aa06c735..716c0116b 100644
+--- a/drivers/platform/x86/acer-wmi.c
++++ b/drivers/platform/x86/acer-wmi.c
+@@ -409,6 +409,7 @@ struct quirk_entry {
+ 	u8 bluetooth;
+ 	bool turbo;
+ 	bool turbo_led_state_valid;
++	bool turbo_profile;
+ 	bool no_eco_profile;
+ 	u8 cpu_fans;
+ 	u8 gpu_fans;
+@@ -512,6 +513,7 @@ static struct quirk_entry quirk_acer_predator_pt14_51 = {
+ static struct quirk_entry quirk_acer_predator_pt516_52s = {
+ 	.turbo = true,
+ 	.turbo_led_state_valid = true,
++	.turbo_profile = true,
+ 	.no_eco_profile = true,
+ 	.cpu_fans = 1,
+ 	.gpu_fans = 1,
+@@ -905,19 +907,24 @@ static const struct dmi_system_id non_acer_quirks[] __initconst = {
+ };
+ 
+ /*
+- * Serializes mode key and platform profile transactions and protects
+- * platform_profile_device and last_non_turbo_profile.
++ * Serializes Turbo key and platform profile transactions and protects
++ * platform_profile_device, last_non_turbo_profile and turbo_key_profile.
+  * Taken inside the platform profile core's lock (profile_set callback).
+  */
+ static DEFINE_MUTEX(acer_turbo_lock);
+ static struct device *platform_profile_device;
+ 
+ /*
+- * The profile used before turbo mode. This variable is needed for
+- * returning from turbo mode when the mode key is in toggle mode.
++ * The profile used before turbo mode, restored when the mode key (toggle
++ * mode) or the Turbo key leaves it.
+  */
+ static int last_non_turbo_profile = INT_MIN;
+ 
++/*
++ * Turbo mode was enabled by the Turbo key together with the Turbo profile.
++ */
++static bool turbo_key_profile;
++
+ enum acer_predator_v4_thermal_profile {
+ 	ACER_PREDATOR_V4_THERMAL_PROFILE_QUIET		= 0x00,
+ 	ACER_PREDATOR_V4_THERMAL_PROFILE_BALANCED	= 0x01,
+@@ -2205,21 +2212,74 @@ static void acer_set_turbo(bool on)
+ 	}
+ }
+ 
++/*
++ * On machines with the turbo_profile quirk, the Turbo key also selects
++ * the Turbo thermal profile; switching it off restores the previous one.
++ */
++static int acer_set_turbo_profile(bool on)
++{
++	u8 current_tp;
++	int err;
++
++	if (!platform_profile_device)
++		return -ENODEV;
++
++	err = WMID_gaming_get_misc_setting(ACER_WMID_MISC_SETTING_PLATFORM_PROFILE,
++					   &current_tp);
++	if (err)
++		return err;
++
++	if (on && current_tp != ACER_PREDATOR_V4_THERMAL_PROFILE_TURBO) {
++		err = WMID_gaming_set_misc_setting(ACER_WMID_MISC_SETTING_PLATFORM_PROFILE,
++						   ACER_PREDATOR_V4_THERMAL_PROFILE_TURBO);
++		if (err)
++			return err;
++
++		last_non_turbo_profile = current_tp;
++	} else if (!on && current_tp == ACER_PREDATOR_V4_THERMAL_PROFILE_TURBO) {
++		err = WMID_gaming_set_misc_setting(ACER_WMID_MISC_SETTING_PLATFORM_PROFILE,
++						   last_non_turbo_profile);
++		if (err)
++			return err;
++	}
++
++	turbo_key_profile = on;
++
++	return 0;
++}
++
+ /*
+  *  Predator series turbo button
+  */
+ static int acer_toggle_turbo(void)
+ {
++	struct device *profile_dev = NULL;
+ 	bool on;
+ 	int err;
+ 
++	mutex_lock(&acer_turbo_lock);
+ 	err = acer_get_turbo_led(&on);
+ 	if (err)
+-		return err;
++		goto out;
++
++	if (quirks->turbo_profile && has_cap(ACER_CAP_PLATFORM_PROFILE)) {
++		err = acer_set_turbo_profile(!on);
++		if (err)
++			goto out;
++
++		profile_dev = get_device(platform_profile_device);
++	}
+ 
+ 	acer_set_turbo(!on);
++out:
++	mutex_unlock(&acer_turbo_lock);
++	/* Notify only after the complete transition, without inverting locks. */
++	if (profile_dev) {
++		platform_profile_notify(profile_dev);
++		put_device(profile_dev);
++	}
+ 
+-	return 0;
++	return err;
+ }
+ 
+ static int
+@@ -2287,9 +2347,16 @@ acer_predator_v4_platform_profile_set(struct device *dev,
+ 	if (err)
+ 		goto out;
+ 
+-	if (tp != ACER_PREDATOR_V4_THERMAL_PROFILE_TURBO)
++	if (tp != ACER_PREDATOR_V4_THERMAL_PROFILE_TURBO) {
+ 		last_non_turbo_profile = tp;
+ 
++		/* Leaving the Turbo profile also ends turbo mode set by the key. */
++		if (turbo_key_profile) {
++			turbo_key_profile = false;
++			acer_set_turbo(false);
++		}
++	}
++
+ out:
+ 	mutex_unlock(&acer_turbo_lock);
+ 	return err;
+@@ -2671,8 +2738,8 @@ static void acer_wmi_notify(union acpi_object *obj, void *context)
+ 		acer_kbd_dock_event(&return_value);
+ 		break;
+ 	case WMID_GAMING_TURBO_KEY_EVENT:
+-		if (return_value.key_num == 0x4)
+-			acer_toggle_turbo();
++		if (return_value.key_num == 0x4 && acer_toggle_turbo())
++			pr_warn_ratelimited("Failed to toggle turbo mode\n");
+ 		if (return_value.key_num == 0x5 && has_cap(ACER_CAP_PLATFORM_PROFILE))
+ 			acer_thermal_profile_change();
+ 		break;
+-- 
+2.54.0
+

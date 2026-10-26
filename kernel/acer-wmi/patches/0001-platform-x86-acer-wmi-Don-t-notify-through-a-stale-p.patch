@@ -1,0 +1,211 @@
+From 9fa14f4670abdb934c33cfe1beba937fb8108d5c Mon Sep 17 00:00:00 2001
+From: Nicholas DeTello <no-reply@detello.com>
+Date: Tue, 6 Oct 2026 07:47:29 -0400
+Subject: [PATCH 01/11] platform/x86: acer-wmi: Don't notify through a stale
+ platform profile device
+
+When the mode key is configured to toggle Turbo
+(cycle_gaming_thermal_profile=0), acer_thermal_profile_change() passes
+platform_profile_device to platform_profile_notify(), which checks
+nothing before dereferencing it. The pointer is invalid in three
+reachable cases:
+
+- The WMI notify handler is installed before the platform device is
+  probed, so a key press during module load sees NULL.
+- A failed registration leaves an ERR_PTR in the pointer, and the
+  driver stays loaded because a probe failure does not fail module
+  init.
+- After a later probe failure or a sysfs unbind, devres frees the class
+  device while the pointer still refers to it.
+
+Publish the pointer only after a successful registration and clear it on
+probe failure and removal, all under a new mutex that also serializes
+the mode key with profile changes. Hold a reference across the
+notification, which is sent after dropping the mutex because the profile
+core calls the driver with its own lock held. Without a registered
+profile device the mode key now returns -ENODEV in both modes instead of
+cycling the profiles of other drivers.
+
+Found by code inspection; not reproduced.
+
+Fixes: 07f531b395db ("ACPI: platform_profile: Remove platform_profile_handler from exported symbols")
+Fixes: 9523ea90cb17 ("platform/x86: acer-wmi: Use devm_platform_profile_register()")
+Assisted-by: LLM
+---
+ drivers/platform/x86/acer-wmi.c | 107 +++++++++++++++++++++-----------
+ 1 file changed, 71 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/platform/x86/acer-wmi.c b/drivers/platform/x86/acer-wmi.c
+index 9e3758c57..51bfba59d 100644
+--- a/drivers/platform/x86/acer-wmi.c
++++ b/drivers/platform/x86/acer-wmi.c
+@@ -13,6 +13,7 @@
+ 
+ #include <linux/kernel.h>
+ #include <linux/minmax.h>
++#include <linux/mutex.h>
+ #include <linux/module.h>
+ #include <linux/init.h>
+ #include <linux/types.h>
+@@ -875,6 +876,12 @@ static const struct dmi_system_id non_acer_quirks[] __initconst = {
+ 	{}
+ };
+ 
++/*
++ * Serializes mode key and platform profile transactions and protects
++ * platform_profile_device and last_non_turbo_profile.
++ * Taken inside the platform profile core's lock (profile_set callback).
++ */
++static DEFINE_MUTEX(acer_turbo_lock);
+ static struct device *platform_profile_device;
+ 
+ /*
+@@ -2197,14 +2204,17 @@ acer_predator_v4_platform_profile_set(struct device *dev,
+ 		return -EOPNOTSUPP;
+ 	}
+ 
++	mutex_lock(&acer_turbo_lock);
+ 	err = WMID_gaming_set_misc_setting(ACER_WMID_MISC_SETTING_PLATFORM_PROFILE, tp);
+ 	if (err)
+-		return err;
++		goto out;
+ 
+ 	if (tp != ACER_PREDATOR_V4_THERMAL_PROFILE_TURBO)
+ 		last_non_turbo_profile = tp;
+ 
+-	return 0;
++out:
++	mutex_unlock(&acer_turbo_lock);
++	return err;
+ }
+ 
+ static int
+@@ -2230,52 +2240,70 @@ static const struct platform_profile_ops acer_predator_v4_platform_profile_ops =
+ 
+ static int acer_platform_profile_setup(struct platform_device *device)
+ {
+-	if (quirks->platform_profile) {
+-		platform_profile_device = devm_platform_profile_register(
+-			&device->dev, "acer-wmi", NULL, &acer_predator_v4_platform_profile_ops);
+-		if (IS_ERR(platform_profile_device))
+-			return PTR_ERR(platform_profile_device);
+-	}
++	struct device *profile_dev;
++
++	if (!quirks->platform_profile)
++		return 0;
++
++	profile_dev = devm_platform_profile_register(&device->dev, "acer-wmi", NULL,
++						     &acer_predator_v4_platform_profile_ops);
++	if (IS_ERR(profile_dev))
++		return PTR_ERR(profile_dev);
++
++	mutex_lock(&acer_turbo_lock);
++	platform_profile_device = profile_dev;
++	mutex_unlock(&acer_turbo_lock);
++
+ 	return 0;
+ }
+ 
+ static int acer_thermal_profile_change(void)
+ {
+-	/*
+-	 * This mode key will either cycle through each mode or toggle the
+-	 * most performant profile.
+-	 */
+-	if (quirks->platform_profile) {
+-		u8 current_tp;
+-		int err, tp;
++	struct device *profile_dev = NULL;
++	u8 current_tp;
++	int err, tp;
+ 
+-		if (cycle_gaming_thermal_profile) {
+-			platform_profile_cycle();
+-		} else {
+-			err = WMID_gaming_get_misc_setting(
+-				ACER_WMID_MISC_SETTING_PLATFORM_PROFILE, &current_tp);
+-			if (err)
+-				return err;
++	if (!quirks->platform_profile)
++		return 0;
+ 
+-			if (current_tp == ACER_PREDATOR_V4_THERMAL_PROFILE_TURBO)
+-				tp = last_non_turbo_profile;
+-			else
+-				tp = ACER_PREDATOR_V4_THERMAL_PROFILE_TURBO;
++	mutex_lock(&acer_turbo_lock);
++	if (!platform_profile_device) {
++		err = -ENODEV;
++		goto out;
++	}
+ 
+-			err = WMID_gaming_set_misc_setting(
+-				ACER_WMID_MISC_SETTING_PLATFORM_PROFILE, tp);
+-			if (err)
+-				return err;
++	/* Cycling calls profile_get/set while holding the core profile lock. */
++	if (cycle_gaming_thermal_profile) {
++		mutex_unlock(&acer_turbo_lock);
++		return platform_profile_cycle();
++	}
++
++	err = WMID_gaming_get_misc_setting(ACER_WMID_MISC_SETTING_PLATFORM_PROFILE,
++					   &current_tp);
++	if (err)
++		goto out;
+ 
+-			/* Store last profile for toggle */
+-			if (current_tp != ACER_PREDATOR_V4_THERMAL_PROFILE_TURBO)
+-				last_non_turbo_profile = current_tp;
++	if (current_tp == ACER_PREDATOR_V4_THERMAL_PROFILE_TURBO)
++		tp = last_non_turbo_profile;
++	else
++		tp = ACER_PREDATOR_V4_THERMAL_PROFILE_TURBO;
+ 
+-			platform_profile_notify(platform_profile_device);
+-		}
++	err = WMID_gaming_set_misc_setting(ACER_WMID_MISC_SETTING_PLATFORM_PROFILE, tp);
++	if (err)
++		goto out;
++
++	if (current_tp != ACER_PREDATOR_V4_THERMAL_PROFILE_TURBO)
++		last_non_turbo_profile = current_tp;
++
++	profile_dev = get_device(platform_profile_device);
++out:
++	mutex_unlock(&acer_turbo_lock);
++	if (profile_dev) {
++		platform_profile_notify(profile_dev);
++		put_device(profile_dev);
+ 	}
+ 
+-	return 0;
++	return err;
+ }
+ 
+ /*
+@@ -2837,6 +2865,9 @@ static int acer_platform_probe(struct platform_device *device)
+ 
+ error_hwmon:
+ error_platform_profile:
++	mutex_lock(&acer_turbo_lock);
++	platform_profile_device = NULL;
++	mutex_unlock(&acer_turbo_lock);
+ 	acer_rfkill_exit();
+ error_rfkill:
+ 	if (has_cap(ACER_CAP_BRIGHTNESS))
+@@ -2850,6 +2881,10 @@ static int acer_platform_probe(struct platform_device *device)
+ 
+ static void acer_platform_remove(struct platform_device *device)
+ {
++	mutex_lock(&acer_turbo_lock);
++	platform_profile_device = NULL;
++	mutex_unlock(&acer_turbo_lock);
++
+ 	if (has_cap(ACER_CAP_MAILLED))
+ 		acer_led_exit();
+ 	if (has_cap(ACER_CAP_BRIGHTNESS))
+-- 
+2.54.0
+

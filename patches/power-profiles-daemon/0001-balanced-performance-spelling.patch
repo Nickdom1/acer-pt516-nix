@@ -1,0 +1,51 @@
+From 3fe661e528ff977bcea17dd7e693069d60ab81c0 Mon Sep 17 00:00:00 2001
+From: Nicholas DeTello <no-reply@detello.com>
+Date: Tue, 6 Oct 2026 07:45:49 -0400
+Subject: [PATCH] platform_profile: Recognize the kernel's
+ "balanced-performance" spelling
+
+The kernel's ACPI platform_profile class
+(drivers/acpi/platform_profile.c) names
+PLATFORM_PROFILE_BALANCED_PERFORMANCE "balanced-performance" (hyphen) in
+/sys/firmware/acpi/platform_profile and platform_profile_choices.
+acpi_platform_profile_value_to_profile() only matches
+"balanced_performance" (underscore), so the hyphenated value is reported
+as "Unhandled ACPI platform profile" and resolves to PPD_PROFILE_UNSET.
+update_acpi_platform_profile_state() then drops the change, and ppd
+keeps advertising whatever profile was active before, e.g. "performance"
+after a firmware hotkey (acer-wmi's Predator mode key, among others) has
+already switched the platform to balanced-performance.
+
+The exact-match code came from commit 6b565b0b05a2 ("Recognize the
+custom ACPI platform profile"), which replaced the previous first-letter
+matching (under which "balanced-performance" mapped to balanced). Accept
+the hyphenated kernel spelling and keep the underscore one for
+compatibility.
+
+Add an integration test that switches the sysfs attribute to
+"balanced-performance" behind the daemon's back and expects
+ActiveProfile to follow to "balanced".
+
+Backported to 0.30 for the predator-nix bundle.
+
+Fixes: 6b565b0b05a2 ("Recognize the custom ACPI platform profile")
+(cherry picked from commit 16c0ad23a58aa57f0a8dd51045f6776831cbfc26)
+---
+ src/ppd-driver-platform-profile.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/ppd-driver-platform-profile.c b/src/ppd-driver-platform-profile.c
+index 28fc33509..6a955b59b 100644
+--- a/src/ppd-driver-platform-profile.c
++++ b/src/ppd-driver-platform-profile.c
+@@ -89,6 +89,7 @@ acpi_platform_profile_value_to_profile (const char *str)
+     return PPD_PROFILE_POWER_SAVER;
+ 
+   if (g_str_equal (str, "balanced") ||
++      g_str_equal (str, "balanced-performance") ||
+       g_str_equal (str, "balanced_performance") ||
+       g_str_equal (str, "cool"))
+     return PPD_PROFILE_BALANCED;
+-- 
+2.54.0
+

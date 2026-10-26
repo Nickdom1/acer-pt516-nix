@@ -1,0 +1,94 @@
+From b688e9a4c8fcb42161392cc8581df7f0da73a664 Mon Sep 17 00:00:00 2001
+From: Nicholas DeTello <no-reply@detello.com>
+Date: Tue, 6 Oct 2026 07:47:30 -0400
+Subject: [PATCH 06/11] platform/x86: acer-wmi: Add support for Acer Predator
+ PT516-52s
+
+The Predator Triton 500 SE PT516-52s (board Volante_ADH) uses the
+PredatorSense v4 gaming interface: its thermal profile (misc setting
+0x0B) supports Quiet, Balanced, Performance and Turbo, and
+GetGamingSysInfo reports CPU/GPU temperatures and one CPU and one GPU
+fan. Its dedicated Turbo key raises WMI event 7 with key number 4, and
+its SetGamingLED handler needs the flagged LED state.
+
+Add a quirk entry enabling turbo mode, the platform profile, hwmon and
+fan control for it. The firmware's supported-profile bitmap (misc
+setting 0x0A reads 0x33) has no Eco mode, and the firmware's WMI
+handler, when asked for Eco (6), stores it in the EC mode register but
+leaves the Intel DTT operating mode and the NVIDIA GPU budget at the
+values of the previous mode, so add a no_eco_profile quirk that leaves
+low-power out of the advertised choices; the platform-profile core then
+rejects it.
+
+The firmware's bitmap is not consulted, as the driver stopped using it in
+commit b0908e03fdd4 ("platform/x86: acer-wmi: Stop using ACPI bitmap for
+platform profile choices").
+
+Tested on BIOS V1.04: profile switching, hwmon temperatures and fan
+speeds, manual PWM and the Turbo key toggling fan turbo mode in both
+directions.
+
+Assisted-by: LLM
+---
+ drivers/platform/x86/acer-wmi.c | 24 +++++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/platform/x86/acer-wmi.c b/drivers/platform/x86/acer-wmi.c
+index 0f512ab60..1aa06c735 100644
+--- a/drivers/platform/x86/acer-wmi.c
++++ b/drivers/platform/x86/acer-wmi.c
+@@ -409,6 +409,7 @@ struct quirk_entry {
+ 	u8 bluetooth;
+ 	bool turbo;
+ 	bool turbo_led_state_valid;
++	bool no_eco_profile;
+ 	u8 cpu_fans;
+ 	u8 gpu_fans;
+ 	bool hwmon;
+@@ -508,6 +509,17 @@ static struct quirk_entry quirk_acer_predator_pt14_51 = {
+ 	.pwm = true,
+ };
+ 
++static struct quirk_entry quirk_acer_predator_pt516_52s = {
++	.turbo = true,
++	.turbo_led_state_valid = true,
++	.no_eco_profile = true,
++	.cpu_fans = 1,
++	.gpu_fans = 1,
++	.hwmon = true,
++	.platform_profile = true,
++	.pwm = true,
++};
++
+ static struct quirk_entry quirk_acer_predator_v4 = {
+ 	.hwmon = true,
+ 	.platform_profile = true,
+@@ -770,6 +782,15 @@ static const struct dmi_system_id acer_quirks[] __initconst = {
+ 		},
+ 		.driver_data = &quirk_acer_predator_pt14_51,
+ 	},
++	{
++		.callback = dmi_matched,
++		.ident = "Acer Predator PT516-52s",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "Predator PT516-52s"),
++		},
++		.driver_data = &quirk_acer_predator_pt516_52s,
++	},
+ 	{
+ 		.callback = set_force_caps,
+ 		.ident = "Acer Aspire Switch 10E SW3-016",
+@@ -2281,7 +2302,8 @@ acer_predator_v4_platform_profile_probe(void *drvdata, unsigned long *choices)
+ 	set_bit(PLATFORM_PROFILE_BALANCED_PERFORMANCE, choices);
+ 	set_bit(PLATFORM_PROFILE_BALANCED, choices);
+ 	set_bit(PLATFORM_PROFILE_QUIET, choices);
+-	set_bit(PLATFORM_PROFILE_LOW_POWER, choices);
++	if (!quirks->no_eco_profile)
++		set_bit(PLATFORM_PROFILE_LOW_POWER, choices);
+ 
+ 	/* Set default non-turbo profile */
+ 	last_non_turbo_profile = ACER_PREDATOR_V4_THERMAL_PROFILE_BALANCED;
+-- 
+2.54.0
+

@@ -1,0 +1,100 @@
+From 1c6750eefe668a303743a3669f21c8a71f882aaa Mon Sep 17 00:00:00 2001
+From: Nicholas DeTello <no-reply@detello.com>
+Date: Tue, 6 Oct 2026 07:45:49 -0400
+Subject: [PATCH] intel-pstate: Restore the powersave governor before writing
+ EPP
+
+intel_pstate refuses to move energy_performance_preference away from
+"performance" while a policy uses the performance governor: the write
+fails with EBUSY. ppd therefore switches every EPP policy to the
+powersave governor, but only once, at probe.
+
+Another program can change scaling_governor afterwards; GameMode
+selects the performance governor by default. A later profile change
+then fails. When firmware or a hotkey moves platform_profile to
+balanced, the EPP write returns EBUSY, driver_profile_changed_cb()
+ignores the failure, and ppd keeps advertising performance while the
+platform is balanced.
+
+Before applying a preference, read each EPP policy's scaling_governor
+and write powersave where it differs, as probe does, but only while
+intel_pstate still reports active mode: in passive mode "powersave" is
+the generic governor and must not be forced, the rule probe has
+followed since commit 23103bca59bf ("intel-pstate: Don't change
+scaling_governor if P-State isn't active"). Read and write failures
+are returned like the EPP write failures. This matches amd-pstate,
+which has set the governor on every profile change since commit
+0cdf32c3db85 ("Don't change governor for amd-pstate at probe").
+
+This makes ppd, rather than the last writer, the owner of the governor
+while intel_pstate is active: a profile change, an AC/battery change
+or resume now replaces a performance governor that another program
+selected (GameMode's, for example), and with it that governor's
+minimum-frequency floor. The alternative is to leave such a governor
+alone and report that the profile could not be applied; that keeps
+the other program's choice, but the advertised profile stays stale
+until the governor changes back.
+
+The tests set the governor of two policies to performance behind the
+daemon's back, then make external balanced and low-power transitions,
+and check that ActiveProfile, the governor and EPP follow; a second
+test switches the driver to passive mode and checks that the governor
+is left alone. The mocked sysfs cannot return EBUSY, so the tests check
+the restored state, not the kernel's refusal.
+---
+ src/ppd-driver-intel-pstate.c | 32 ++++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/src/ppd-driver-intel-pstate.c b/src/ppd-driver-intel-pstate.c
+index 869650647..8913d306e 100644
+--- a/src/ppd-driver-intel-pstate.c
++++ b/src/ppd-driver-intel-pstate.c
+@@ -324,6 +324,19 @@ profile_to_epb_pref (PpdProfile profile, gboolean battery)
+   g_return_val_if_reached (NULL);
+ }
+ 
++static gboolean
++intel_pstate_is_active (void)
++{
++  g_autofree char *pstate_status_path = NULL;
++  g_autofree char *status = NULL;
++
++  pstate_status_path = ppd_utils_get_sysfs_path (PSTATE_STATUS_PATH);
++  if (!g_file_get_contents (pstate_status_path, &status, NULL, NULL))
++    return FALSE;
++
++  return g_strcmp0 (g_strchomp (status), "active") == 0;
++}
++
+ static gboolean
+ apply_pref_to_devices (PpdDriver   *driver,
+                        PpdProfile   profile,
+@@ -342,6 +355,25 @@ apply_pref_to_devices (PpdDriver   *driver,
+   if (pstate->epp_devices) {
+     const char *epp_pref = profile_to_epp_pref (profile, pstate->on_battery);
+ 
++    /* Another program may have changed the governor since probe. Intel
++     * P-State rejects non-performance EPP values under the performance
++     * governor, so restore the prerequisite before applying preferences.
++     * Only do so while the driver is still in active mode: in passive
++     * mode "powersave" would select the generic governor.
++     */
++    for (guint i = 0; intel_pstate_is_active () && i < pstate->epp_devices->len; i++) {
++      const char *epp_path = g_ptr_array_index (pstate->epp_devices, i);
++      g_autofree char *policy_dir = g_path_get_dirname (epp_path);
++      g_autofree char *gov_path = g_build_filename (policy_dir, "scaling_governor", NULL);
++      g_autofree char *governor = NULL;
++
++      if (!g_file_get_contents (gov_path, &governor, NULL, error))
++        return FALSE;
++      if (g_strcmp0 (g_strchomp (governor), DEFAULT_CPU_FREQ_SCALING_GOV) != 0 &&
++          !ppd_utils_write (gov_path, DEFAULT_CPU_FREQ_SCALING_GOV, error))
++        return FALSE;
++    }
++
+     if (!ppd_utils_write_files (pstate->epp_devices, epp_pref, error))
+       return FALSE;
+   }
+-- 
+2.54.0
+

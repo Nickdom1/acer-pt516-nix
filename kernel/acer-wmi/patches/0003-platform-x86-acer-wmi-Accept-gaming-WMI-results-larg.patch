@@ -1,0 +1,43 @@
+From 779d4bf0aa5de1d624dafc536e5c33a348a6409f Mon Sep 17 00:00:00 2001
+From: Nicholas DeTello <no-reply@detello.com>
+Date: Tue, 6 Oct 2026 07:47:29 -0400
+Subject: [PATCH 03/11] platform/x86: acer-wmi: Accept gaming WMI results
+ larger than 8 bytes
+
+WMI_gaming_execute_u64() accepts result buffers of exactly 4 or 8 bytes,
+while WMI_gaming_execute_u32_u64() already accepts buffers of at least
+8 bytes. Some firmware declares larger outputs: on the Predator
+PT516-52s (BIOS V1.04) the binary MOF describes GetGamingLED as
+
+  void GetGamingLED([in] uint32 gmInput, [out] uint8 gmReturn,
+                    [out] uint8 gmOutput[11]);
+
+and the ACPI method returns a 12-byte buffer ({status, state, ...}), so
+reading the turbo LED state fails.
+
+Read the first 8 bytes of any buffer that is at least 8 bytes long.
+
+No currently supported model is known to return more than 8 bytes, so
+this only matters together with the following patches.
+
+Assisted-by: LLM
+---
+ drivers/platform/x86/acer-wmi.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/platform/x86/acer-wmi.c b/drivers/platform/x86/acer-wmi.c
+index 40677f82c..c0443b9be 100644
+--- a/drivers/platform/x86/acer-wmi.c
++++ b/drivers/platform/x86/acer-wmi.c
+@@ -1598,7 +1598,7 @@ WMI_gaming_execute_u64(u32 method_id, u64 in, u64 *out)
+ 	case ACPI_TYPE_BUFFER:
+ 		if (obj->buffer.length == sizeof(u32))
+ 			*out = get_unaligned_le32(obj->buffer.pointer);
+-		else if (obj->buffer.length == sizeof(u64))
++		else if (obj->buffer.length >= sizeof(u64))
+ 			*out = get_unaligned_le64(obj->buffer.pointer);
+ 		else
+ 			status = AE_ERROR;
+-- 
+2.54.0
+

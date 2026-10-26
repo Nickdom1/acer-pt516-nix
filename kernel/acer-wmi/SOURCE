@@ -1,0 +1,7 @@
+export: release
+repo: https://git.kernel.org/pub/scm/linux/kernel/git/pdx86/platform-drivers-x86.git
+branch: prep/linux-abc
+base: 2622c23b7b640476a06d767b6ae63315ba5993a8 (2026-10-05)
+head: 7cf5a7c3615952b30a08bb190d3d78a68a1d667a
+acer-wmi.c at base: sha256 d4abd6c93c44a9e5e28bbee9045fc53b1c2137cb213ed2a592ba114b490e3682
+acer-wmi.c at head: sha256 3c268c39c43801adb18d090d75f9225e17eb8fd33579fc682a18838489799332

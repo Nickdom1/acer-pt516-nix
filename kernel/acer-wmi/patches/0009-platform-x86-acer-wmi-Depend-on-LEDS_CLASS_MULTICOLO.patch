@@ -1,0 +1,48 @@
+From 469f2b9cff8726c300128321df88158549f46c40 Mon Sep 17 00:00:00 2001
+From: Nicholas DeTello <no-reply@detello.com>
+Date: Mon, 5 Oct 2026 19:54:57 -0400
+Subject: [PATCH 09/11] platform/x86: acer-wmi: Depend on LEDS_CLASS_MULTICOLOR
+
+The next patch registers multicolor LED class devices. The multicolor
+LED class has no stubs for when it is disabled, so using it optionally
+would need IS_REACHABLE(), which silently drops the devices when the
+class is a module and the driver is built in. Make LEDS_CLASS_MULTICOLOR
+a dependency of ACER_WMI instead. LEDS_CLASS_MULTICOLOR depends on
+LEDS_CLASS and NEW_LEDS, so drop the selects of those two symbols:
+keeping them next to the new dependency forms a recursive Kconfig
+dependency.
+
+A configuration that enables ACER_WMI but not LEDS_CLASS_MULTICOLOR
+loses ACER_WMI after this change, and ACER_WMI can be built in only if
+LEDS_CLASS_MULTICOLOR is. HID_LOGITECH, HID_PLAYSTATION and
+UNIWILL_LAPTOP already depend on LEDS_CLASS_MULTICOLOR the same way.
+
+Assisted-by: LLM
+---
+ drivers/platform/x86/Kconfig | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/drivers/platform/x86/Kconfig b/drivers/platform/x86/Kconfig
+index 7ee9ff387..6d05d78d4 100644
+--- a/drivers/platform/x86/Kconfig
++++ b/drivers/platform/x86/Kconfig
+@@ -158,6 +158,7 @@ config ACER_WIRELESS
+ config ACER_WMI
+ 	tristate "Acer WMI Laptop Extras"
+ 	depends on BACKLIGHT_CLASS_DEVICE
++	depends on LEDS_CLASS_MULTICOLOR
+ 	depends on SERIO_I8042
+ 	depends on INPUT
+ 	depends on RFKILL || RFKILL = n
+@@ -166,8 +167,6 @@ config ACER_WMI
+ 	depends on ACPI_VIDEO || ACPI_VIDEO = n
+ 	depends on HWMON
+ 	select INPUT_SPARSEKMAP
+-	select LEDS_CLASS
+-	select NEW_LEDS
+ 	select ACPI_PLATFORM_PROFILE
+ 	help
+ 	  This is a driver for newer Acer (and Wistron) laptops. It adds
+-- 
+2.54.0
+
